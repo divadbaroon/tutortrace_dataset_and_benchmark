@@ -1,0 +1,15 @@
+deployments:
+  deployment_1:
+    raw_telemetry: raw_telemetry/deployment_1.json
+    split: train
+    enabled: true
+  deployment_2:
+    raw_telemetry: raw_telemetry/deployment_2.json
+    split: test
+    enabled: true
+
+tasks:
+  next_behavioral_state: true
+  next_behavioral_sequence: true
+  query_imminence: true
+  query_with_no_effort: true
