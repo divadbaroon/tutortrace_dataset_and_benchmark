@@ -1151,7 +1151,7 @@ def main():
 
     with open(out_path, 'w') as f:
         json.dump(serialized, f, indent=2)
-    print(f"  Results saved to {out_path}")
+    print(f" Results saved to {out_path}")
 
 
 if __name__ == '__main__':
