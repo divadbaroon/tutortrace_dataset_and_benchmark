@@ -218,7 +218,7 @@ def evaluate(model, X_train, y_train, X_test, y_test, task_type='binary'):
 
 
 # ══════════════════════════════════════════════════════════════
-#  LSTM MODEL (used by Seg-LSTM)
+#  SEQUENCE MODELS (for behavioral state sequences)
 # ══════════════════════════════════════════════════════════════
 
 if HAS_TORCH:
@@ -232,6 +232,56 @@ if HAS_TORCH:
         def forward(self, x):
             out, _ = self.lstm(x)
             return self.fc(self.drop(out[:, -1, :]))
+
+    class GRUModel(nn.Module):
+        def __init__(self, input_dim, hidden=64, layers=2, n_classes=2, dropout=0.3):
+            super().__init__()
+            self.gru = nn.GRU(input_dim, hidden, layers, batch_first=True, dropout=dropout)
+            self.fc = nn.Linear(hidden, n_classes)
+            self.drop = nn.Dropout(dropout)
+
+        def forward(self, x):
+            out, _ = self.gru(x)
+            return self.fc(self.drop(out[:, -1, :]))
+
+    class TemporalCNNModel(nn.Module):
+        def __init__(self, input_dim, hidden=64, n_classes=2, dropout=0.3):
+            super().__init__()
+            self.conv1 = nn.Conv1d(input_dim, hidden, kernel_size=3, padding=1)
+            self.conv2 = nn.Conv1d(hidden, hidden, kernel_size=3, padding=1)
+            self.conv3 = nn.Conv1d(hidden, hidden, kernel_size=3, padding=1)
+            self.pool = nn.AdaptiveAvgPool1d(1)
+            self.fc = nn.Linear(hidden, n_classes)
+            self.drop = nn.Dropout(dropout)
+            self.relu = nn.ReLU()
+
+        def forward(self, x):
+            # x: (batch, seq_len, features) -> (batch, features, seq_len)
+            x = x.transpose(1, 2)
+            x = self.relu(self.conv1(x))
+            x = self.relu(self.conv2(x))
+            x = self.relu(self.conv3(x))
+            x = self.pool(x).squeeze(-1)
+            return self.fc(self.drop(x))
+
+    class TransformerModel(nn.Module):
+        def __init__(self, input_dim, hidden=64, n_heads=4, layers=2, n_classes=2, dropout=0.3):
+            super().__init__()
+            self.proj = nn.Linear(input_dim, hidden)
+            self.pos_enc = nn.Parameter(torch.randn(1, SEG_SEQ_LEN, hidden) * 0.02)
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=hidden, nhead=n_heads, dim_feedforward=hidden * 4,
+                dropout=dropout, batch_first=True
+            )
+            self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=layers)
+            self.fc = nn.Linear(hidden, n_classes)
+            self.drop = nn.Dropout(dropout)
+
+        def forward(self, x):
+            x = self.proj(x) + self.pos_enc[:, :x.size(1), :]
+            x = self.encoder(x)
+            x = x.mean(dim=1)  # global average pooling
+            return self.fc(self.drop(x))
 
 
 # ══════════════════════════════════════════════════════════════
@@ -314,9 +364,9 @@ if HAS_TORCH:
 
         return sequences
 
-    def train_seg_lstm(sequences_train, y_train, sequences_test, y_test,
-                       n_classes=2, epochs=50, hidden=64, return_probs=False):
-        """Train LSTM on actual behavioral state sequences."""
+    def train_seq_model(model_class, sequences_train, y_train, sequences_test, y_test,
+                        n_classes=2, epochs=50, hidden=64, return_probs=False):
+        """Train any sequence model on behavioral state sequences."""
         train_dl = DataLoader(
             SegSeqDataset(sequences_train, y_train.values),
             batch_size=64, shuffle=True
@@ -328,7 +378,7 @@ if HAS_TORCH:
 
         feat_dim = sequences_train[0].shape[1]  # 12
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        model = LSTMModel(feat_dim, hidden=hidden, n_classes=n_classes).to(device)
+        model = model_class(feat_dim, hidden=hidden, n_classes=n_classes).to(device)
         opt = torch.optim.Adam(model.parameters(), lr=0.001)
         crit = nn.CrossEntropyLoss()
 
@@ -453,41 +503,60 @@ def run_ablation(df_train, df_test, task_name, target_col, feature_layers,
                 xgb_probs = m.predict_proba(Xte)
         print()
 
-    # Seq-LSTM (proper behavioral sequence model)
-    lstm_probs = None
+    # Sequence models (proper behavioral state sequences)
+    best_seq_probs = None
+    best_seq_auc = 0
+    best_seq_name = None
+
     if HAS_TORCH and seg_train is not None and seg_test is not None:
-        print(f"  {'Seq-LSTM':<25s}", end='')
-        all_results['Seq-LSTM'] = {}
+        # Build sequences once, reuse for all models
+        mode = 'window' if time_col == 'window_end_s' else 'query'
+        seq_tr = build_segment_sequences(train, seg_train, time_col=time_col, mode=mode)
+        seq_te = build_segment_sequences(test, seg_test, time_col=time_col, mode=mode)
+
+        seq_models = {
+            'Seq-LSTM':        LSTMModel,
+            'Seq-GRU':         GRUModel,
+            'Seq-CNN':         TemporalCNNModel,
+            'Seq-Transformer': TransformerModel,
+        }
+
+        for model_name, model_class in seq_models.items():
+            print(f"  {model_name:<25s}", end='')
+            all_results[model_name] = {}
+
+            for layer_name in layer_names:
+                if layer_name == last_layer:
+                    res, probs = train_seq_model(
+                        model_class, seq_tr, y_train, seq_te, y_test,
+                        n_classes=n_classes, return_probs=True
+                    )
+                    all_results[model_name][layer_name] = res
+                    print(f"  {res['auc']:>8.3f} / {res['macro_f1']:>.3f}", end='')
+
+                    # Track best sequence model for ensemble
+                    if res.get('auc', 0) > best_seq_auc:
+                        best_seq_auc = res['auc']
+                        best_seq_probs = probs
+                        best_seq_name = model_name
+                else:
+                    all_results[model_name][layer_name] = {'auc': 0, 'macro_f1': 0, 'accuracy': 0}
+                    print(f"  {'—':>14s}", end='')
+            print()
+
+    # Ensemble: XGBoost + best sequence model
+    if xgb_probs is not None and best_seq_probs is not None:
+        ensemble_name = f'XGB + {best_seq_name}'
+        print(f"  {ensemble_name:<25s}", end='')
+        all_results[ensemble_name] = {}
 
         for layer_name in layer_names:
             if layer_name == last_layer:
-                mode = 'window' if time_col == 'window_end_s' else 'query'
-                seq_tr = build_segment_sequences(train, seg_train, time_col=time_col, mode=mode)
-                seq_te = build_segment_sequences(test, seg_test, time_col=time_col, mode=mode)
-
-                res, lstm_probs = train_seg_lstm(
-                    seq_tr, y_train, seq_te, y_test,
-                    n_classes=n_classes, return_probs=True
-                )
-                all_results['Seq-LSTM'][layer_name] = res
+                res = evaluate_ensemble(xgb_probs, best_seq_probs, y_test, task_type=task_type)
+                all_results[ensemble_name][layer_name] = res
                 print(f"  {res['auc']:>8.3f} / {res['macro_f1']:>.3f}", end='')
             else:
-                all_results['Seq-LSTM'][layer_name] = {'auc': 0, 'macro_f1': 0, 'accuracy': 0}
-                print(f"  {'—':>14s}", end='')
-        print()
-
-    # Ensemble: XGBoost + Seq-LSTM
-    if xgb_probs is not None and lstm_probs is not None:
-        print(f"  {'XGB + Seq-LSTM':<25s}", end='')
-        all_results['XGB + Seq-LSTM'] = {}
-
-        for layer_name in layer_names:
-            if layer_name == last_layer:
-                res = evaluate_ensemble(xgb_probs, lstm_probs, y_test, task_type=task_type)
-                all_results['XGB + Seq-LSTM'][layer_name] = res
-                print(f"  {res['auc']:>8.3f} / {res['macro_f1']:>.3f}", end='')
-            else:
-                all_results['XGB + Seq-LSTM'][layer_name] = {'auc': 0, 'macro_f1': 0, 'accuracy': 0}
+                all_results[ensemble_name][layer_name] = {'auc': 0, 'macro_f1': 0, 'accuracy': 0}
                 print(f"  {'—':>14s}", end='')
         print()
 
@@ -1063,7 +1132,7 @@ def main():
     4. High delegation query (binary)
 
   Ablation: Raw telemetry → +Observable metrics → +Behavioral sequences
-  Baselines: Majority, LogReg, RF{', XGBoost' if HAS_XGBOOST else ''}{', Seq-LSTM, XGB+Seq-LSTM' if HAS_TORCH else ''}
+  Baselines: Majority, LogReg, RF{', XGBoost' if HAS_XGBOOST else ''}{', Seq-LSTM, Seq-GRU, Seq-CNN, Seq-Transformer, XGB+Best' if HAS_TORCH else ''}
   Metrics: AUC / Macro F1
     """)
 
