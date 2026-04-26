@@ -15,6 +15,7 @@ Tasks:
     2. Next behavioral sequence (k=3, k=5)
     3. Query imminence (5s, 10s, 15s, 30s, 45s, 60s)
     4. Query with no effort (binary)
+    5. High delegation query (binary)
 """
 
 import sys
@@ -934,6 +935,86 @@ def main():
             results['query_with_no_effort'] = res
 
     # ══════════════════════════════════════════════════════════
+    #  TASK 4: HIGH DELEGATION QUERY (binary)
+    # ══════════════════════════════════════════════════════════
+
+    if tasks.get('query_type'):
+        print("\n" + "=" * 60)
+        print("  TASK 4: HIGH DELEGATION QUERY (binary)")
+        print("=" * 60)
+
+        # Load query datasets
+        train_queries = pd.concat([load_dataset(n, 'queries') for n in train_names], ignore_index=True)
+        test_queries = pd.concat([load_dataset(n, 'queries') for n in test_names], ignore_index=True)
+
+        # Load query type labels
+        label_dfs = []
+        for name in train_names + test_names:
+            label_path = os.path.join(DATASET_DIR, 'query_labels', f'{name}_labels.csv')
+            if os.path.exists(label_path):
+                ldf = pd.read_csv(label_path)
+                ldf['student_id'] = ldf['student_id'].astype(str)
+                label_dfs.append(ldf)
+            else:
+                print(f"  WARNING: {label_path} not found")
+
+        if label_dfs:
+            all_labels = pd.concat(label_dfs, ignore_index=True)
+
+            # Merge labels into queries
+            train_queries = train_queries.merge(
+                all_labels[['student_id', 'query_index', 'query_type']],
+                on=['student_id', 'query_index'], how='left'
+            )
+            test_queries = test_queries.merge(
+                all_labels[['student_id', 'query_index', 'query_type']],
+                on=['student_id', 'query_index'], how='left'
+            )
+
+            # Drop Unknown and empty labels
+            train_queries = train_queries[
+                train_queries['query_type'].notna() &
+                (train_queries['query_type'] != '') &
+                (train_queries['query_type'] != 'Unknown')
+            ].copy()
+            test_queries = test_queries[
+                test_queries['query_type'].notna() &
+                (test_queries['query_type'] != '') &
+                (test_queries['query_type'] != 'Unknown')
+            ].copy()
+
+            # Binary label: high_delegation vs everything else
+            train_queries['label_high_delegation'] = (train_queries['query_type'] == 'high_delegation').astype(int)
+            test_queries['label_high_delegation'] = (test_queries['query_type'] == 'high_delegation').astype(int)
+
+            print(f"  Train: {len(train_queries)} queries ({train_queries['label_high_delegation'].mean()*100:.1f}% high delegation)")
+            print(f"  Test:  {len(test_queries)} queries ({test_queries['label_high_delegation'].mean()*100:.1f}% high delegation)")
+
+            print(f"\n  Query type distribution (train):")
+            for qt, count in train_queries['query_type'].value_counts().items():
+                print(f"    {qt}: {count}")
+
+            # Use only pre-query features (no post, no query content)
+            QUERY_CONTENT_FEATURES = {'query_length_chars', 'ai_response_length_chars'}
+            q_layers = {
+                'Raw telemetry':     [c for c in Q_LAYER_1 if c in train_queries.columns and c not in POST_LEAKY and c not in QUERY_CONTENT_FEATURES],
+                '+Observable':       [c for c in Q_LAYER_2 if c in train_queries.columns and c not in POST_LEAKY and c not in QUERY_CONTENT_FEATURES],
+                '+Behav. sequences': [c for c in Q_LAYER_3 if c in train_queries.columns and c not in POST_LEAKY and c not in QUERY_CONTENT_FEATURES],
+            }
+
+            res = run_ablation(
+                train_queries, test_queries,
+                'High delegation query', 'label_high_delegation',
+                q_layers, task_type='binary',
+                seg_train=train_segments, seg_test=test_segments,
+                time_col='time_since_session_start_s',
+            )
+            if res:
+                results['high_delegation'] = res
+        else:
+            print("  SKIPPED (no query type labels found)")
+
+    # ══════════════════════════════════════════════════════════
     #  WINDOW SIZE ANALYSIS
     # ══════════════════════════════════════════════════════════
 
@@ -979,6 +1060,7 @@ def main():
     2. Query imminence (5s, 10s, 15s, 30s, 45s, 60s)
        2b. Time to next query (regression)
     3. Query with no effort (binary)
+    4. High delegation query (binary)
 
   Ablation: Raw telemetry → +Observable metrics → +Behavioral sequences
   Baselines: Majority, LogReg, RF{', XGBoost' if HAS_XGBOOST else ''}{', Seq-LSTM, XGB+Seq-LSTM' if HAS_TORCH else ''}

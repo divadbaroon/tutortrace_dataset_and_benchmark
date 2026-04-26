@@ -13,3 +13,4 @@ tasks:
   next_behavioral_sequence: true
   query_imminence: true
   query_with_no_effort: true
+  query_type: true
