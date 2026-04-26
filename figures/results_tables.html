@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>TutorTrace Benchmark Results</title>
+<style>
+  body { font-family: 'Times New Roman', serif; max-width: 1100px; margin: 40px auto; padding: 0 20px; color: #111; }
+  h1 { font-size: 22px; text-align: center; margin-bottom: 6px; }
+  .subtitle { font-size: 13px; text-align: center; color: #666; margin-bottom: 30px; }
+  h2 { font-size: 16px; margin-top: 40px; border-bottom: 2px solid #111; padding-bottom: 4px; }
+  table { border-collapse: collapse; width: 100%; margin: 16px 0 30px 0; font-size: 13px; }
+  th, td { padding: 6px 12px; text-align: center; }
+  th { border-top: 2px solid #111; border-bottom: 1px solid #111; font-weight: bold; }
+  td { border-bottom: none; }
+  tr:last-child td { border-bottom: 2px solid #111; }
+  .task-header td { border-top: 1px solid #999; }
+  .task-label { text-align: left; font-weight: 600; }
+  .model-name { text-align: left; padding-left: 20px; }
+  .best { font-weight: bold; }
+  caption { font-size: 13px; text-align: left; margin-bottom: 8px; font-style: italic; }
+  .overview { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 20px; margin: 20px 0 30px 0; }
+  .overview-card { border: 1px solid #ddd; border-radius: 8px; padding: 16px; }
+  .overview-card h3 { font-size: 13px; margin: 0 0 12px 0; color: #666; text-transform: uppercase; letter-spacing: 0.5px; }
+  .stat-row { display: flex; justify-content: space-between; font-size: 13px; padding: 3px 0; }
+  .stat-label { color: #555; }
+  .stat-value { font-weight: 600; font-family: 'Courier New', monospace; }
+  .stat-big { font-size: 28px; font-weight: 800; color: #111; margin-bottom: 4px; }
+  .stat-desc { font-size: 11px; color: #888; }
+  .highlight-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 20px 0; }
+  .highlight-card { text-align: center; padding: 16px; border: 1px solid #eee; border-radius: 8px; }
+</style>
+</head>
+<body>
+<h2>Dataset Overview</h2>
+<table>
+<caption>Deployment summary.</caption>
+<tr><th style="text-align:left">Metric</th><th>Deployment 1 (Train)</th><th>Deployment 2 (Test)</th><th>Combined</th></tr>
+<tr><td style="text-align:left">Students</td><td>190</td><td>113</td><td>303</td></tr>
+<tr><td style="text-align:left">Students using AI</td><td>94</td><td>90</td><td>184</td></tr>
+<tr><td style="text-align:left">Tasks completed</td><td>157/190 (83%)</td><td>93/113 (82%)</td><td>250/303</td></tr>
+<tr><td style="text-align:left">Avg session (min)</td><td>10.3</td><td>16.0</td><td>—</td></tr>
+<tr><td style="text-align:left">Median session (min)</td><td>8.6</td><td>15.8</td><td>—</td></tr>
+<tr><td style="text-align:left">Total minutes</td><td>1955</td><td>1810</td><td>3765</td></tr>
+</table>
+<table>
+<caption>Telemetry event counts.</caption>
+<tr><th style="text-align:left">Event Category</th><th>Deployment 1</th><th>Deployment 2</th><th>Combined</th></tr>
+<tr><td style="text-align:left">Raw events (all)</td><td>244,546</td><td>204,059</td><td>448,605</td></tr>
+<tr><td style="text-align:left">Raw events (excl. mouse/clicks)</td><td>59,469</td><td>46,866</td><td>106,335</td></tr>
+<tr><td style="text-align:left">Code edits (CODE_TYPE)</td><td>26,462</td><td>17,454</td><td>43,916</td></tr>
+<tr><td style="text-align:left">Code deletes</td><td>7,295</td><td>4,887</td><td>12,182</td></tr>
+<tr><td style="text-align:left">Terminal runs</td><td>1,328</td><td>909</td><td>2,237</td></tr>
+<tr><td style="text-align:left">Terminal output</td><td>4,573</td><td>2,553</td><td>7,126</td></tr>
+<tr><td style="text-align:left">Terminal errors</td><td>638</td><td>453</td><td>1,091</td></tr>
+<tr><td style="text-align:left">Test results</td><td>690</td><td>456</td><td>1,146</td></tr>
+<tr><td style="text-align:left">AI queries</td><td>428</td><td>540</td><td>968</td></tr>
+<tr><td style="text-align:left">AI responses</td><td>427</td><td>538</td><td>965</td></tr>
+<tr><td style="text-align:left">Chat typing events</td><td>12,583</td><td>14,645</td><td>27,228</td></tr>
+<tr><td style="text-align:left">Tab state changes</td><td>2,238</td><td>1,635</td><td>3,873</td></tr>
+<tr><td style="text-align:left">Mouse moves</td><td>175,870</td><td>150,257</td><td>326,127</td></tr>
+</table>
+<table>
+<caption>Behavioral segment distribution (auto-segmenter output).</caption>
+<tr><th style="text-align:left">Behavioral State</th><th>Deployment 1</th><th>%</th><th>Deployment 2</th><th>%</th></tr>
+<tr><td style="text-align:left">thinking</td><td>2,327</td><td>48.5%</td><td>1,800</td><td>47.9%</td></tr>
+<tr><td style="text-align:left">debugging</td><td>1,354</td><td>28.2%</td><td>942</td><td>25.1%</td></tr>
+<tr><td style="text-align:left">implementing</td><td>498</td><td>10.4%</td><td>344</td><td>9.2%</td></tr>
+<tr><td style="text-align:left">seekingHelp</td><td>454</td><td>9.5%</td><td>559</td><td>14.9%</td></tr>
+<tr><td style="text-align:left">testing</td><td>168</td><td>3.5%</td><td>113</td><td>3.0%</td></tr>
+<tr style="font-weight:600"><td style="text-align:left">Total</td><td>4,801</td><td></td><td>3,758</td><td></td></tr>
+</table>
+<table>
+<caption>Thinking subtype distribution (Deployment 1).</caption>
+<tr><th style="text-align:left">Subtype</th><th>Count</th><th>%</th></tr>
+<tr><td style="text-align:left; font-family:monospace; font-size:12px">thinking-error</td><td>1,212</td><td>52.1%</td></tr>
+<tr><td style="text-align:left; font-family:monospace; font-size:12px">thinking-code</td><td>476</td><td>20.5%</td></tr>
+<tr><td style="text-align:left; font-family:monospace; font-size:12px">thinking-llm</td><td>449</td><td>19.3%</td></tr>
+<tr><td style="text-align:left; font-family:monospace; font-size:12px">thinking-task</td><td>190</td><td>8.2%</td></tr>
+<tr style="font-weight:600"><td style="text-align:left">Total</td><td>2,327</td><td></td></tr>
+</table>
+<h2>Main Results</h2>
+<table>
+<caption>Held-out AUC / Macro F1 across all tasks and three feature abstraction layers.</caption>
+<tr><th style="text-align:left">Task</th><th style="text-align:left">Model</th><th colspan="2">Raw telemetry</th><th colspan="2">+Observable</th><th colspan="2">+Behav. sequences</th></tr>
+<tr><th></th><th></th><th>AUC</th><th>F1</th><th>AUC</th><th>F1</th><th>AUC</th><th>F1</th></tr>
+<tr class="task-header"><td class="task-label" rowspan="5">Next behavioral state (5-class)</td><td class="model-name">Majority</td><td>0.500</td><td>0.096</td><td>0.500</td><td>0.096</td><td>0.500</td><td>0.096</td></tr>
+<tr><td class="model-name">LogReg</td><td>0.687</td><td>0.302</td><td>0.726</td><td>0.323</td><td class="best">0.814</td><td>0.409</td></tr>
+<tr><td class="model-name">RandomForest</td><td>0.649</td><td>0.324</td><td>0.719</td><td>0.341</td><td>0.809</td><td>0.434</td></tr>
+<tr><td class="model-name">XGBoost</td><td>0.687</td><td>0.286</td><td>0.710</td><td>0.363</td><td>0.802</td><td>0.458</td></tr>
+<tr><td class="model-name">LSTM</td><td>0.673</td><td>0.332</td><td>0.685</td><td>0.366</td><td>0.790</td><td>0.484</td></tr>
+<tr class="task-header"><td class="task-label" rowspan="5">Thinking subtype (conditional)</td><td class="model-name">Majority</td><td>0.500</td><td>0.267</td><td>0.500</td><td>0.267</td><td>0.500</td><td>0.267</td></tr>
+<tr><td class="model-name">LogReg</td><td>0.713</td><td>0.366</td><td>0.798</td><td>0.492</td><td>0.992</td><td>0.943</td></tr>
+<tr><td class="model-name">RandomForest</td><td>0.651</td><td>0.386</td><td>0.762</td><td>0.487</td><td>0.983</td><td>0.733</td></tr>
+<tr><td class="model-name">XGBoost</td><td>0.724</td><td>0.384</td><td>0.817</td><td>0.473</td><td class="best">0.998</td><td>0.733</td></tr>
+<tr><td class="model-name">LSTM</td><td>0.627</td><td>0.469</td><td>0.819</td><td>0.511</td><td>0.989</td><td>0.961</td></tr>
+<tr class="task-header"><td class="task-label" rowspan="5">Query imminence (60s)</td><td class="model-name">Majority</td><td>0.500</td><td>0.464</td><td>0.500</td><td>0.464</td><td>0.500</td><td>0.464</td></tr>
+<tr><td class="model-name">LogReg</td><td>0.723</td><td>0.556</td><td>0.809</td><td>0.601</td><td class="best">0.817</td><td>0.615</td></tr>
+<tr><td class="model-name">RandomForest</td><td>0.440</td><td>0.496</td><td>0.784</td><td>0.567</td><td>0.785</td><td>0.558</td></tr>
+<tr><td class="model-name">XGBoost</td><td>0.717</td><td>0.480</td><td>0.797</td><td>0.581</td><td>0.801</td><td>0.576</td></tr>
+<tr><td class="model-name">LSTM</td><td>0.475</td><td>0.539</td><td>0.648</td><td>0.563</td><td>0.713</td><td>0.597</td></tr>
+<tr class="task-header"><td class="task-label" rowspan="5">Query with no effort</td><td class="model-name">Majority</td><td>0.500</td><td>0.365</td><td>0.500</td><td>0.365</td><td>0.500</td><td>0.365</td></tr>
+<tr><td class="model-name">LogReg</td><td>0.572</td><td>0.553</td><td>0.871</td><td>0.793</td><td>0.882</td><td>0.801</td></tr>
+<tr><td class="model-name">RandomForest</td><td>0.558</td><td>0.503</td><td>0.897</td><td>0.782</td><td>0.896</td><td>0.772</td></tr>
+<tr><td class="model-name">XGBoost</td><td>0.569</td><td>0.555</td><td>0.901</td><td>0.827</td><td class="best">0.914</td><td>0.831</td></tr>
+<tr><td class="model-name">LSTM</td><td>0.590</td><td>0.530</td><td>0.733</td><td>0.663</td><td>0.738</td><td>0.627</td></tr>
+</table>
+<h2>Compact Summary (Best Model per Task)</h2>
+<table>
+<tr><th style="text-align:left">Task</th><th>Raw AUC/F1</th><th>+Observable AUC/F1</th><th>+Behav. Seq. AUC/F1</th><th>ΔAUC</th></tr>
+<tr><td style="text-align:left">Next behavioral state (5-class)</td><td>0.687 / 0.302</td><td>0.726 / 0.323</td><td>0.814 / 0.409</td><td>+0.127</td></tr>
+<tr><td style="text-align:left">Thinking subtype (conditional)</td><td>0.724 / 0.384</td><td>0.819 / 0.511</td><td>0.998 / 0.733</td><td>+0.274</td></tr>
+<tr><td style="text-align:left">Query imminence (60s)</td><td>0.723 / 0.556</td><td>0.809 / 0.601</td><td>0.817 / 0.615</td><td>+0.095</td></tr>
+<tr><td style="text-align:left">Query with no effort</td><td>0.590 / 0.530</td><td>0.901 / 0.827</td><td>0.914 / 0.831</td><td>+0.324</td></tr>
+</table>
+<h2>Query Imminence Across Horizons</h2>
+<table>
+<tr><th>Horizon</th><th>Best Model</th><th>Raw</th><th>+Observable</th><th>+Behav. Seq.</th></tr>
+<tr><td>15s</td><td>LogReg</td><td>0.733</td><td>0.812</td><td>0.814</td></tr>
+<tr><td>30s</td><td>LogReg</td><td>0.731</td><td>0.810</td><td>0.813</td></tr>
+<tr><td>45s</td><td>LogReg</td><td>0.725</td><td>0.808</td><td>0.813</td></tr>
+<tr><td>60s</td><td>LogReg</td><td>0.723</td><td>0.809</td><td>0.817</td></tr>
+</table>
+</body></html>

@@ -296,11 +296,149 @@ if HAS_TORCH:
 
 
 # ══════════════════════════════════════════════════════════════
+#  SEGMENT-SEQUENCE LSTM (proper behavioral sequence model)
+# ══════════════════════════════════════════════════════════════
+
+STATE_TO_IDX = {s: i for i, s in enumerate(STATE_NAMES)}
+SUBTYPE_TO_IDX = {
+    '': 0, 'none': 0,
+    'thinking-task': 1, 'thinking-llm': 2,
+    'thinking-error': 3, 'thinking-code': 4,
+}
+SEG_SEQ_LEN = 30  # max segments to look back
+
+if HAS_TORCH:
+    class SegSeqDataset(Dataset):
+        """Dataset that provides actual behavioral state sequences."""
+        def __init__(self, sequences, labels):
+            self.sequences = sequences  # list of (seq_len, feat_dim) arrays
+            self.labels = labels
+
+        def __len__(self):
+            return len(self.labels)
+
+        def __getitem__(self, idx):
+            return torch.FloatTensor(self.sequences[idx]), torch.LongTensor([self.labels[idx]])
+
+    def build_segment_sequences(df, seg_df, time_col='window_end_s', mode='window'):
+        """Build actual behavioral state sequences aligned to prediction points.
+
+        For each row in df, gathers the student's segments up to that time point
+        and encodes each segment as: [state_one_hot(5), subtype_one_hot(5), duration_s, log_duration]
+
+        Returns: list of numpy arrays, each shape (SEG_SEQ_LEN, 12)
+        """
+        feat_dim = 12  # 5 state + 5 subtype + duration + log_duration
+        sequences = []
+
+        # Pre-group segments by student for efficiency
+        seg_grouped = {}
+        for sid, group in seg_df.groupby('student_id'):
+            seg_grouped[str(sid)] = group.sort_values('start_time_ms')
+
+        col = 'window_end_s' if mode == 'window' else 'time_since_session_start_s'
+
+        for _, row in df.iterrows():
+            sid = str(row['student_id'])
+            cutoff_ms = row[col] * 1000
+
+            # Get this student's segments up to cutoff
+            student_segs = seg_grouped.get(sid, pd.DataFrame())
+            if len(student_segs) > 0:
+                student_segs = student_segs[student_segs['start_time_ms'] < cutoff_ms]
+
+            # Take last SEG_SEQ_LEN segments
+            student_segs = student_segs.tail(SEG_SEQ_LEN)
+
+            # Encode each segment
+            seq = np.zeros((SEG_SEQ_LEN, feat_dim))
+            offset = SEG_SEQ_LEN - len(student_segs)
+
+            for i, (_, seg) in enumerate(student_segs.iterrows()):
+                pos = offset + i
+
+                # State one-hot (5 dims)
+                state_idx = STATE_TO_IDX.get(seg['behavioral_state'], 0)
+                seq[pos, state_idx] = 1.0
+
+                # Subtype one-hot (5 dims)
+                subtype = seg.get('thinking_subtype', '') or ''
+                subtype_idx = SUBTYPE_TO_IDX.get(subtype, 0)
+                seq[pos, 5 + subtype_idx] = 1.0
+
+                # Duration features (2 dims)
+                dur = max(0.01, seg.get('duration_s', 0) or 0)
+                seq[pos, 10] = min(dur / 60.0, 5.0)  # normalized, capped at 5 min
+                seq[pos, 11] = np.log1p(dur)  # log duration
+
+            sequences.append(seq)
+
+        return sequences
+
+    def train_seg_lstm(sequences_train, y_train, sequences_test, y_test,
+                       n_classes=2, epochs=50, hidden=64):
+        """Train LSTM on actual behavioral state sequences."""
+        train_dl = DataLoader(
+            SegSeqDataset(sequences_train, y_train.values),
+            batch_size=64, shuffle=True
+        )
+        test_dl = DataLoader(
+            SegSeqDataset(sequences_test, y_test.values),
+            batch_size=64, shuffle=False
+        )
+
+        feat_dim = sequences_train[0].shape[1]  # 12
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model = LSTMModel(feat_dim, hidden=hidden, n_classes=n_classes).to(device)
+        opt = torch.optim.Adam(model.parameters(), lr=0.001)
+        crit = nn.CrossEntropyLoss()
+
+        model.train()
+        for _ in range(epochs):
+            for bx, by in train_dl:
+                bx, by = bx.to(device), by.squeeze().to(device)
+                opt.zero_grad()
+                crit(model(bx), by).backward()
+                opt.step()
+
+        model.eval()
+        probs, preds = [], []
+        with torch.no_grad():
+            for bx, _ in test_dl:
+                out = model(bx.to(device))
+                probs.append(torch.softmax(out, dim=1).cpu().numpy())
+                preds.append(out.argmax(dim=1).cpu().numpy())
+
+        probs = np.vstack(probs)
+        preds = np.concatenate(preds)
+
+        results = {
+            'accuracy': accuracy_score(y_test, preds),
+            'macro_f1': f1_score(y_test, preds, average='macro', zero_division=0),
+        }
+        try:
+            if n_classes == 2:
+                results['auc'] = roc_auc_score(y_test, probs[:, 1])
+            else:
+                results['auc'] = roc_auc_score(y_test, probs, multi_class='ovr', average='macro')
+        except:
+            results['auc'] = 0.5
+
+        return results
+
+
+# ══════════════════════════════════════════════════════════════
 #  ABLATION RUNNER
 # ══════════════════════════════════════════════════════════════
 
-def run_ablation(df_train, df_test, task_name, target_col, feature_layers, task_type='binary'):
-    """Run all baselines across feature layers for one task."""
+def run_ablation(df_train, df_test, task_name, target_col, feature_layers,
+                 task_type='binary', seg_train=None, seg_test=None, time_col='window_end_s'):
+    """Run all baselines across feature layers for one task.
+
+    Args:
+        seg_train, seg_test: segment DataFrames for Seg-LSTM (optional)
+        time_col: column to align segments to ('window_end_s' or 'time_since_session_start_s')
+    """
     train = df_train.dropna(subset=[target_col]).copy()
     test = df_test.dropna(subset=[target_col]).copy()
 
@@ -347,7 +485,7 @@ def run_ablation(df_train, df_test, task_name, target_col, feature_layers, task_
             print(f"  {res['auc']:>8.3f} / {res['macro_f1']:>.3f}", end='')
         print()
 
-    # LSTM
+    # LSTM on flat features
     if HAS_TORCH:
         print(f"  {'LSTM':<25s}", end='')
         all_results['LSTM'] = {}
@@ -358,6 +496,31 @@ def run_ablation(df_train, df_test, task_name, target_col, feature_layers, task_
             res = train_lstm(X_train, y_train, X_test, y_test, n_classes=n_classes)
             all_results['LSTM'][layer_name] = res
             print(f"  {res['auc']:>8.3f} / {res['macro_f1']:>.3f}", end='')
+        print()
+
+    # Segment-Sequence LSTM (proper behavioral sequence model)
+    if HAS_TORCH and seg_train is not None and seg_test is not None:
+        print(f"  {'Seq-LSTM':<25s}", end='')
+        all_results['Seq-LSTM'] = {}
+        layer_names = list(feature_layers.keys())
+
+        for layer_name in layer_names:
+            if layer_name == list(feature_layers.keys())[-1]:
+                # Only run on the behavioral sequences layer
+                mode = 'window' if time_col == 'window_end_s' else 'query'
+                print(f"  Building segment sequences...", end='', flush=True)
+                print(f"\r  {'Seq-LSTM':<25s}", end='')
+
+                seq_tr = build_segment_sequences(train, seg_train, time_col=time_col, mode=mode)
+                seq_te = build_segment_sequences(test, seg_test, time_col=time_col, mode=mode)
+
+                res = train_seg_lstm(seq_tr, y_train, seq_te, y_test, n_classes=n_classes)
+                all_results['Seq-LSTM'][layer_name] = res
+                print(f"  {res['auc']:>8.3f} / {res['macro_f1']:>.3f}", end='')
+            else:
+                # Not applicable for raw/observable layers
+                all_results['Seq-LSTM'][layer_name] = {'auc': 0, 'macro_f1': 0, 'accuracy': 0}
+                print(f"  {'—':>14s}", end='')
         print()
 
     return all_results
@@ -511,8 +674,13 @@ def main():
     train_windows = pd.concat([load_dataset(n, 'windows') for n in train_names], ignore_index=True)
     test_windows = pd.concat([load_dataset(n, 'windows') for n in test_names], ignore_index=True)
 
+    # Load segment datasets for Seq-LSTM
+    train_segments = pd.concat([load_dataset(n, 'segments') for n in train_names], ignore_index=True)
+    test_segments = pd.concat([load_dataset(n, 'segments') for n in test_names], ignore_index=True)
+
     print(f"  Train: {len(train_windows):,} windows, {train_windows['student_id'].nunique()} students")
     print(f"  Test:  {len(test_windows):,} windows, {test_windows['student_id'].nunique()} students")
+    print(f"  Segments: {len(train_segments):,} train, {len(test_segments):,} test")
 
     # Window-level feature layers
     window_layers = {
@@ -543,6 +711,7 @@ def main():
             train_windows, test_windows,
             'Next behavioral state', 'label_next_state',
             window_layers, task_type='multiclass',
+            seg_train=train_segments, seg_test=test_segments,
         )
         if res:
             results['next_behavioral_state'] = res
@@ -584,6 +753,7 @@ def main():
                 train_think, test_think,
                 'Thinking subtype', 'label_next_thinking_subtype',
                 window_layers, task_type='multiclass',
+                seg_train=train_segments, seg_test=test_segments,
             )
             if res:
                 results['thinking_subtype'] = res
@@ -621,6 +791,7 @@ def main():
                 train_windows, test_windows,
                 f'Query imminence ({horizon}s)', label_col,
                 window_layers, task_type='binary',
+                seg_train=train_segments, seg_test=test_segments,
             )
             if res:
                 results[f'query_imminence_{horizon}s'] = res
@@ -651,6 +822,8 @@ def main():
             train_queries, test_queries,
             'Query with no effort', 'label_query_no_effort',
             q_layers, task_type='binary',
+            seg_train=train_segments, seg_test=test_segments,
+            time_col='time_since_session_start_s',
         )
         if res:
             results['query_with_no_effort'] = res
@@ -702,7 +875,7 @@ def main():
     3. Query with no effort (binary)
 
   Ablation: Raw telemetry → +Observable metrics → +Behavioral sequences
-  Baselines: Majority, LogReg, RF{', XGBoost' if HAS_XGBOOST else ''}{', LSTM' if HAS_TORCH else ''}
+  Baselines: Majority, LogReg, RF{', XGBoost' if HAS_XGBOOST else ''}{', LSTM, Seq-LSTM' if HAS_TORCH else ''}
   Metrics: AUC / Macro F1
     """)
 
