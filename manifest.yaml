@@ -8,22 +8,22 @@ deployments:
   deployment_2:
     raw_telemetry: raw_telemetry/deployment_2.json
     split: test
-    enabled: true
+    enabled: false
   # Dr. Lewis am Session (Python)
   deployment_3:
     raw_telemetry: raw_telemetry/deployment_3.json
     split: test
-    enabled: true
+    enabled: false
   # Dr. Lewis am Session (Python) - 4/27/2026
   deployment_4:
     raw_telemetry: raw_telemetry/deployment_4.json
     split: test
-    enabled: true
+    enabled: false
   # Dr. Lewis pm Session (Python) - 4/27/2026
   deployment_5:
     raw_telemetry: raw_telemetry/deployment_5.json
     split: test
-    enabled: true
+    enabled: false
   # Saad pm session (C) - 4/27/2026
   deployment_6:
     raw_telemetry: raw_telemetry/deployment_6.json
