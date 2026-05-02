@@ -11,11 +11,12 @@ Usage:
     python run_benchmark.py
 
 Tasks:
-    1. Next behavioral state (multiclass)
-    2. Next behavioral sequence (k=3, k=5)
-    3. Query imminence (5s, 10s, 15s, 30s, 45s, 60s)
-    4. Query with no effort (binary)
-    5. High delegation query (binary)
+    1. Next behavioral state (window-level, 5-class)
+       1a. Thinking subtype (4-class, conditional)
+       1b. Next behavioral sequence (k=3, k=5)
+    2. Error imminence (window-level, binary at multiple horizons)
+    3. Query imminence (window-level, binary at multiple horizons)
+    4. Post-query improvement (query-level, binary)
 """
 
 import sys
@@ -28,21 +29,19 @@ import warnings
 from collections import Counter
 
 from sklearn.base import clone
-from sklearn.dummy import DummyClassifier, DummyRegressor
-from sklearn.linear_model import LogisticRegression, LinearRegression
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.dummy import DummyClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.metrics import (
     roc_auc_score, f1_score, accuracy_score,
     classification_report,
-    mean_absolute_error, mean_squared_error, r2_score,
 )
 
 warnings.filterwarnings('ignore')
 
-# Optional imports
 try:
-    from xgboost import XGBClassifier, XGBRegressor
+    from xgboost import XGBClassifier
     HAS_XGBOOST = True
 except ImportError:
     HAS_XGBOOST = False
@@ -55,7 +54,7 @@ try:
     HAS_TORCH = True
 except ImportError:
     HAS_TORCH = False
-    print("  NOTE: torch not installed. LSTM/Ensemble baselines will be skipped.")
+    print("  NOTE: torch not installed. Sequential/Ensemble baselines will be skipped.")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -68,7 +67,7 @@ MANIFEST_PATH = os.path.join(ROOT_DIR, 'manifest.yaml')
 
 STATE_NAMES = ['thinking', 'implementing', 'debugging', 'seekingHelp', 'testing']
 
-# Feature groups for ablation
+# Window-level feature groups for ablation
 LAYER_1_FEATURES = [
     'code_events', 'terminal_runs', 'terminal_errors', 'test_results',
     'query_count', 'event_density', 'longest_idle_s', 'thinking_time_s',
@@ -81,13 +80,12 @@ LAYER_2_FEATURES = LAYER_1_FEATURES + [
     'prior_no_effort_rate',
 ]
 
-
 LAYER_3_FEATURES = LAYER_2_FEATURES + [
     'segments_in_window', 'pct_thinking', 'pct_implementing',
     'pct_debugging', 'pct_seekingHelp', 'pct_testing',
 ]
 
-# Query-level feature groups
+# Query-level feature groups (pre-query behavioral features only)
 Q_LAYER_1 = [
     'pre_code_edits', 'pre_terminal_runs', 'pre_terminal_errors',
     'pre_chars_inserted', 'pre_chars_deleted', 'pre_net_code_growth',
@@ -107,35 +105,14 @@ Q_LAYER_2 = Q_LAYER_1 + [
     'pre_response_reading_time_s', 'pre_chat_to_code_latency_s',
     'pre_tab_switches', 'pre_tab_hidden_time_s',
     'thinking_task_s', 'thinking_llm_s', 'thinking_error_s', 'thinking_code_s',
-    'post_thinking_llm_s', 'post_thinking_error_s', 'post_thinking_code_s',
     'time_since_last_query_s',
     'query_length_chars', 'ai_response_length_chars',
-    'test_passed_at_query', 'test_total_at_query',
 ]
 
 Q_LAYER_3 = Q_LAYER_2 + [
     'implementing_time_s', 'debugging_time_s', 'testing_time_s',
     'seeking_help_time_s',
-    'post_response_implementing_s', 'post_response_debugging_s',
-    'post_response_thinking_s', 'post_response_seeking_help_s',
-    'post_response_testing_s',
-    'post_code_edits', 'post_code_edit_rate',
-    'post_terminal_runs', 'post_terminal_errors',
-    'post_error_self_fix',
 ]
-
-# Features that leak into no-effort prediction (direct effort signals only)
-# Thinking/cognitive features (post_thinking_*, post_response_thinking_s,
-# post_response_seeking_help_s) are KEPT — they measure cognitive engagement
-# after the AI response, not effort toward the task.
-POST_LEAKY = {
-    'post_code_edits', 'post_code_edit_rate',
-    'post_terminal_runs', 'post_terminal_errors',
-    'post_error_self_fix',
-    'post_response_implementing_s',
-    'post_response_debugging_s',
-    'post_response_testing_s',
-}
 
 
 # ══════════════════════════════════════════════════════════════
@@ -148,7 +125,6 @@ def load_manifest():
 
 
 def load_dataset(deployment_name, dataset_type):
-    """Load a prepared CSV by deployment name and type (segments/windows/queries)."""
     paths = {
         'segments': os.path.join(DATASET_DIR, 'behavioral_sequences', f'{deployment_name}_segments.csv'),
         'windows':  os.path.join(DATASET_DIR, 'observable_metrics', 'window_level', f'{deployment_name}_windows.csv'),
@@ -183,7 +159,6 @@ def get_baselines():
 
 
 def evaluate(model, X_train, y_train, X_test, y_test, task_type='binary'):
-    """Train, predict, return metrics."""
     scaler = StandardScaler()
     Xtr = scaler.fit_transform(X_train)
     Xte = scaler.transform(X_test)
@@ -220,7 +195,7 @@ def evaluate(model, X_train, y_train, X_test, y_test, task_type='binary'):
 
 
 # ══════════════════════════════════════════════════════════════
-#  MLP MODEL (for flat / observable metric features)
+#  MLP MODEL
 # ══════════════════════════════════════════════════════════════
 
 if HAS_TORCH:
@@ -251,7 +226,6 @@ if HAS_TORCH:
 
     def train_mlp(X_train, y_train, X_test, y_test,
                    n_classes=2, epochs=50, hidden=128, return_probs=False):
-        """Train MLP on flat feature vectors."""
         scaler = StandardScaler()
         Xtr = scaler.fit_transform(X_train.values if hasattr(X_train, 'values') else X_train)
         Xte = scaler.transform(X_test.values if hasattr(X_test, 'values') else X_test)
@@ -301,8 +275,16 @@ if HAS_TORCH:
 
 
 # ══════════════════════════════════════════════════════════════
-#  SEQUENCE MODELS (for behavioral state sequences)
+#  SEQUENCE MODELS
 # ══════════════════════════════════════════════════════════════
+
+STATE_TO_IDX = {s: i for i, s in enumerate(STATE_NAMES)}
+SUBTYPE_TO_IDX = {
+    '': 0, 'none': 0,
+    'thinking-task': 1, 'thinking-llm': 2,
+    'thinking-error': 3, 'thinking-code': 4,
+}
+SEG_SEQ_LEN = 30
 
 if HAS_TORCH:
     class LSTMModel(nn.Module):
@@ -339,7 +321,6 @@ if HAS_TORCH:
             self.relu = nn.ReLU()
 
         def forward(self, x):
-            # x: (batch, seq_len, features) -> (batch, features, seq_len)
             x = x.transpose(1, 2)
             x = self.relu(self.conv1(x))
             x = self.relu(self.conv2(x))
@@ -363,47 +344,22 @@ if HAS_TORCH:
         def forward(self, x):
             x = self.proj(x) + self.pos_enc[:, :x.size(1), :]
             x = self.encoder(x)
-            x = x.mean(dim=1)  # global average pooling
+            x = x.mean(dim=1)
             return self.fc(self.drop(x))
 
-
-# ══════════════════════════════════════════════════════════════
-#  SEGMENT-SEQUENCE LSTM (proper behavioral sequence model)
-# ══════════════════════════════════════════════════════════════
-
-STATE_TO_IDX = {s: i for i, s in enumerate(STATE_NAMES)}
-SUBTYPE_TO_IDX = {
-    '': 0, 'none': 0,
-    'thinking-task': 1, 'thinking-llm': 2,
-    'thinking-error': 3, 'thinking-code': 4,
-}
-SEG_SEQ_LEN = 30  # max segments to look back
-
-if HAS_TORCH:
     class SegSeqDataset(Dataset):
-        """Dataset that provides actual behavioral state sequences."""
         def __init__(self, sequences, labels):
-            self.sequences = sequences  # list of (seq_len, feat_dim) arrays
+            self.sequences = sequences
             self.labels = labels
-
         def __len__(self):
             return len(self.labels)
-
         def __getitem__(self, idx):
             return torch.FloatTensor(self.sequences[idx]), torch.LongTensor([self.labels[idx]])
 
     def build_segment_sequences(df, seg_df, time_col='window_end_s', mode='window'):
-        """Build actual behavioral state sequences aligned to prediction points.
-
-        For each row in df, gathers the student's segments up to that time point
-        and encodes each segment as: [state_one_hot(5), subtype_one_hot(5), duration_s, log_duration]
-
-        Returns: list of numpy arrays, each shape (SEG_SEQ_LEN, 12)
-        """
-        feat_dim = 12  # 5 state + 5 subtype + duration + log_duration
+        feat_dim = 12
         sequences = []
 
-        # Pre-group segments by student for efficiency
         seg_grouped = {}
         for sid, group in seg_df.groupby('student_id'):
             seg_grouped[str(sid)] = group.sort_values('start_time_ms')
@@ -414,34 +370,27 @@ if HAS_TORCH:
             sid = str(row['student_id'])
             cutoff_ms = row[col] * 1000
 
-            # Get this student's segments up to cutoff
             student_segs = seg_grouped.get(sid, pd.DataFrame())
             if len(student_segs) > 0:
                 student_segs = student_segs[student_segs['start_time_ms'] < cutoff_ms]
 
-            # Take last SEG_SEQ_LEN segments
             student_segs = student_segs.tail(SEG_SEQ_LEN)
 
-            # Encode each segment
             seq = np.zeros((SEG_SEQ_LEN, feat_dim))
             offset = SEG_SEQ_LEN - len(student_segs)
 
             for i, (_, seg) in enumerate(student_segs.iterrows()):
                 pos = offset + i
-
-                # State one-hot (5 dims)
                 state_idx = STATE_TO_IDX.get(seg['behavioral_state'], 0)
                 seq[pos, state_idx] = 1.0
 
-                # Subtype one-hot (5 dims)
                 subtype = seg.get('thinking_subtype', '') or ''
                 subtype_idx = SUBTYPE_TO_IDX.get(subtype, 0)
                 seq[pos, 5 + subtype_idx] = 1.0
 
-                # Duration features (2 dims)
                 dur = max(0.01, seg.get('duration_s', 0) or 0)
-                seq[pos, 10] = min(dur / 60.0, 5.0)  # normalized, capped at 5 min
-                seq[pos, 11] = np.log1p(dur)  # log duration
+                seq[pos, 10] = min(dur / 60.0, 5.0)
+                seq[pos, 11] = np.log1p(dur)
 
             sequences.append(seq)
 
@@ -449,17 +398,10 @@ if HAS_TORCH:
 
     def train_seq_model(model_class, sequences_train, y_train, sequences_test, y_test,
                         n_classes=2, epochs=50, hidden=64, return_probs=False):
-        """Train any sequence model on behavioral state sequences."""
-        train_dl = DataLoader(
-            SegSeqDataset(sequences_train, y_train.values),
-            batch_size=64, shuffle=True
-        )
-        test_dl = DataLoader(
-            SegSeqDataset(sequences_test, y_test.values),
-            batch_size=64, shuffle=False
-        )
+        train_dl = DataLoader(SegSeqDataset(sequences_train, y_train.values), batch_size=64, shuffle=True)
+        test_dl = DataLoader(SegSeqDataset(sequences_test, y_test.values), batch_size=64, shuffle=False)
 
-        feat_dim = sequences_train[0].shape[1]  # 12
+        feat_dim = sequences_train[0].shape[1]
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         model = model_class(feat_dim, hidden=hidden, n_classes=n_classes).to(device)
         opt = torch.optim.Adam(model.parameters(), lr=0.001)
@@ -501,9 +443,8 @@ if HAS_TORCH:
         return results
 
 
-def evaluate_ensemble(xgb_probs, lstm_probs, y_test, task_type='binary', weight_xgb=0.5):
-    """Evaluate an ensemble of XGBoost + Seq-LSTM by averaging probabilities."""
-    avg_probs = weight_xgb * xgb_probs + (1 - weight_xgb) * lstm_probs
+def evaluate_ensemble(xgb_probs, seq_probs, y_test, task_type='binary', weight_xgb=0.5):
+    avg_probs = weight_xgb * xgb_probs + (1 - weight_xgb) * seq_probs
     preds = avg_probs.argmax(axis=1)
 
     results = {
@@ -527,7 +468,6 @@ def evaluate_ensemble(xgb_probs, lstm_probs, y_test, task_type='binary', weight_
 
 def run_ablation(df_train, df_test, task_name, target_col, feature_layers,
                  task_type='binary', seg_train=None, seg_test=None, time_col='window_end_s'):
-    """Run all baselines across feature layers for one task."""
     train = df_train.dropna(subset=[target_col]).copy()
     test = df_test.dropna(subset=[target_col]).copy()
 
@@ -551,7 +491,6 @@ def run_ablation(df_train, df_test, task_name, target_col, feature_layers,
     else:
         print(f"  Train: {len(y_train)} | Test: {len(y_test)} | Classes: {n_classes}")
 
-    # Header
     print(f"\n  {'Model':<25s}", end='')
     for layer_name in feature_layers:
         print(f"  {layer_name:>22s}", end='')
@@ -563,7 +502,6 @@ def run_ablation(df_train, df_test, task_name, target_col, feature_layers,
     layer_names = list(feature_layers.keys())
     last_layer = layer_names[-1]
 
-    # Classical baselines — capture XGBoost probs for ensemble
     xgb_probs = None
     for model_name, model in baselines.items():
         print(f"  {model_name:<25s}", end='')
@@ -576,7 +514,6 @@ def run_ablation(df_train, df_test, task_name, target_col, feature_layers,
             all_results[model_name][layer_name] = res
             print(f"  {res['auc']:>8.3f} / {res['macro_f1']:>.3f}", end='')
 
-            # Capture XGBoost probs on last layer for ensemble
             if model_name == 'XGBoost' and layer_name == last_layer:
                 scaler = StandardScaler()
                 Xtr = scaler.fit_transform(X_train)
@@ -586,7 +523,6 @@ def run_ablation(df_train, df_test, task_name, target_col, feature_layers,
                 xgb_probs = m.predict_proba(Xte)
         print()
 
-    # MLP on flat features
     if HAS_TORCH:
         print(f"  {'MLP':<25s}", end='')
         all_results['MLP'] = {}
@@ -594,19 +530,16 @@ def run_ablation(df_train, df_test, task_name, target_col, feature_layers,
             avail = [c for c in cols if c in train.columns]
             X_train_layer = train[avail].fillna(0)
             X_test_layer = test[avail].fillna(0)
-            res = train_mlp(X_train_layer, y_train, X_test_layer, y_test,
-                            n_classes=n_classes)
+            res = train_mlp(X_train_layer, y_train, X_test_layer, y_test, n_classes=n_classes)
             all_results['MLP'][layer_name] = res
             print(f"  {res['auc']:>8.3f} / {res['macro_f1']:>.3f}", end='')
         print()
 
-    # Sequence models (proper behavioral state sequences)
     best_seq_probs = None
     best_seq_auc = 0
     best_seq_name = None
 
     if HAS_TORCH and seg_train is not None and seg_test is not None:
-        # Build sequences once, reuse for all models
         mode = 'window' if time_col == 'window_end_s' else 'query'
         seq_tr = build_segment_sequences(train, seg_train, time_col=time_col, mode=mode)
         seq_te = build_segment_sequences(test, seg_test, time_col=time_col, mode=mode)
@@ -631,7 +564,6 @@ def run_ablation(df_train, df_test, task_name, target_col, feature_layers,
                     all_results[model_name][layer_name] = res
                     print(f"  {res['auc']:>8.3f} / {res['macro_f1']:>.3f}", end='')
 
-                    # Track best sequence model for ensemble
                     if res.get('auc', 0) > best_seq_auc:
                         best_seq_auc = res['auc']
                         best_seq_probs = probs
@@ -641,7 +573,6 @@ def run_ablation(df_train, df_test, task_name, target_col, feature_layers,
                     print(f"  {'—':>14s}", end='')
             print()
 
-    # Ensemble: XGBoost + best sequence model
     if xgb_probs is not None and best_seq_probs is not None:
         ensemble_name = f'XGB + {best_seq_name}'
         print(f"  {ensemble_name:<25s}", end='')
@@ -661,92 +592,10 @@ def run_ablation(df_train, df_test, task_name, target_col, feature_layers,
 
 
 # ══════════════════════════════════════════════════════════════
-#  REGRESSION RUNNER (time-to-next-query)
-# ══════════════════════════════════════════════════════════════
-
-def get_regression_baselines():
-    baselines = {
-        'Mean': DummyRegressor(strategy='mean'),
-        'LinearReg': LinearRegression(),
-        'RandomForest': RandomForestRegressor(n_estimators=300, random_state=42, n_jobs=-1),
-    }
-    if HAS_XGBOOST:
-        baselines['XGBoost'] = XGBRegressor(
-            n_estimators=300, max_depth=6, learning_rate=0.1,
-            random_state=42, verbosity=0,
-        )
-    return baselines
-
-
-def evaluate_regression(model, X_train, y_train, X_test, y_test):
-    """Train regression model and return metrics."""
-    scaler = StandardScaler()
-    Xtr = scaler.fit_transform(X_train)
-    Xte = scaler.transform(X_test)
-
-    model.fit(Xtr, y_train)
-    y_pred = model.predict(Xte)
-
-    # Clip predictions to non-negative
-    y_pred = np.maximum(y_pred, 0)
-
-    return {
-        'mae': round(mean_absolute_error(y_test, y_pred), 2),
-        'rmse': round(np.sqrt(mean_squared_error(y_test, y_pred)), 2),
-        'r2': round(r2_score(y_test, y_pred), 4),
-    }
-
-
-def run_regression(df_train, df_test, task_name, target_col, feature_layers,
-                   seg_train=None, seg_test=None, time_col='window_end_s',
-                   max_target=300):
-    """Run regression baselines across feature layers."""
-    train = df_train.dropna(subset=[target_col]).copy()
-    test = df_test.dropna(subset=[target_col]).copy()
-
-    # Cap target to max_target seconds to reduce outlier influence
-    train = train[train[target_col] <= max_target]
-    test = test[test[target_col] <= max_target]
-
-    y_train = train[target_col].astype(float)
-    y_test = test[target_col].astype(float)
-
-    print(f"  Train: {len(y_train)} | Test: {len(y_test)}")
-    print(f"  Target stats — Train: mean={y_train.mean():.1f}s, median={y_train.median():.1f}s | Test: mean={y_test.mean():.1f}s, median={y_test.median():.1f}s")
-
-    # Header
-    print(f"\n  {'Model':<25s}", end='')
-    for layer_name in feature_layers:
-        print(f"  {layer_name:>22s}", end='')
-    print()
-    print(f"  {'-' * (25 + 24 * len(feature_layers))}")
-
-    baselines = get_regression_baselines()
-    all_results = {}
-    layer_names = list(feature_layers.keys())
-    last_layer = layer_names[-1]
-
-    for model_name, model in baselines.items():
-        print(f"  {model_name:<25s}", end='')
-        all_results[model_name] = {}
-        for layer_name, cols in feature_layers.items():
-            avail = [c for c in cols if c in train.columns]
-            X_train = train[avail].fillna(0)
-            X_test = test[avail].fillna(0)
-            res = evaluate_regression(clone(model), X_train, y_train, X_test, y_test)
-            all_results[model_name][layer_name] = res
-            print(f"  {res['mae']:>6.1f} / {res['r2']:>.3f}", end='')
-        print()
-
-    return all_results
-
-
-# ══════════════════════════════════════════════════════════════
 #  SEQUENCE PREDICTION
 # ══════════════════════════════════════════════════════════════
 
 def run_sequence_prediction(df_train, df_test, k):
-    """Predict next k behavioral states."""
     col = f'label_next_{k}_states'
     if col not in df_train.columns:
         return
@@ -772,10 +621,8 @@ def run_sequence_prediction(df_train, df_test, k):
     y_pred = le.inverse_transform(rf.predict(scaler.transform(X_test)))
     y_true = test[col].tolist()
 
-    # Exact match
     exact = sum(1 for t, p in zip(y_true, y_pred) if t == p) / len(y_true)
 
-    # Per-position accuracy
     pos_acc = [0] * k
     for t, p in zip(y_true, y_pred):
         t_states = t.split(',')[:k]
@@ -795,7 +642,6 @@ def run_sequence_prediction(df_train, df_test, k):
 # ══════════════════════════════════════════════════════════════
 
 def print_importance(df, target_col, task_name, feature_cols, top_n=15):
-    """Train RF and print top features."""
     train = df.dropna(subset=[target_col])
     y = train[target_col]
     if isinstance(y.iloc[0], str):
@@ -821,48 +667,6 @@ def print_importance(df, target_col, task_name, feature_cols, top_n=15):
 
 
 # ══════════════════════════════════════════════════════════════
-#  WINDOW SIZE ANALYSIS
-# ══════════════════════════════════════════════════════════════
-
-def run_window_size_analysis(train_windows, test_windows):
-    """Compare query imminence prediction across window sizes (approximate)."""
-    print("\n" + "=" * 60)
-    print("  WINDOW SIZE ANALYSIS")
-    print("=" * 60)
-    print("  (Using 30s windows — full analysis requires regenerating windows at each size)")
-
-    feat_cols = [c for c in LAYER_2_FEATURES if c in train_windows.columns]
-
-    print(f"\n  {'Horizon':>10s}  {'AUC':>8s}  {'F1':>8s}  {'Pos%':>8s}")
-    print(f"  {'-' * 40}")
-
-    for h in [5, 10, 15, 30, 45, 60]:
-        col = f'label_query_imminence_{h}s'
-        if col not in train_windows.columns:
-            continue
-
-        y_train = train_windows[col].astype(int)
-        y_test = test_windows[col].astype(int)
-
-        if y_train.nunique() < 2 or y_test.nunique() < 2:
-            continue
-
-        X_train = train_windows[feat_cols].fillna(0)
-        X_test = test_windows[feat_cols].fillna(0)
-
-        scaler = StandardScaler()
-        rf = RandomForestClassifier(300, class_weight='balanced', random_state=42, n_jobs=-1)
-        rf.fit(scaler.fit_transform(X_train), y_train)
-        y_prob = rf.predict_proba(scaler.transform(X_test))[:, 1]
-
-        auc = roc_auc_score(y_test, y_prob)
-        f1 = f1_score(y_test, rf.predict(scaler.transform(X_test)), average='macro')
-        pos = y_test.mean()
-
-        print(f"  {h:>8d}s  {auc:>8.3f}  {f1:>8.3f}  {pos*100:>7.1f}%")
-
-
-# ══════════════════════════════════════════════════════════════
 #  MAIN
 # ══════════════════════════════════════════════════════════════
 
@@ -871,12 +675,10 @@ def main():
     print("  TUTORTRACE BENCHMARK")
     print("=" * 60)
 
-    # Load manifest
     manifest = load_manifest()
     tasks = manifest.get('tasks', {})
     deployments = manifest.get('deployments', {})
 
-    # Find train/test deployments
     train_names = [n for n, c in deployments.items() if c.get('split') == 'train' and c.get('enabled', True)]
     test_names = [n for n, c in deployments.items() if c.get('split') == 'test' and c.get('enabled', True)]
 
@@ -884,12 +686,9 @@ def main():
         print("  ERROR: Need at least one train and one test deployment.")
         return
 
-    # Load window datasets
     print(f"\n  Loading data...")
     train_windows = pd.concat([load_dataset(n, 'windows') for n in train_names], ignore_index=True)
     test_windows = pd.concat([load_dataset(n, 'windows') for n in test_names], ignore_index=True)
-
-    # Load segment datasets for Seq-LSTM
     train_segments = pd.concat([load_dataset(n, 'segments') for n in train_names], ignore_index=True)
     test_segments = pd.concat([load_dataset(n, 'segments') for n in test_names], ignore_index=True)
 
@@ -897,30 +696,24 @@ def main():
     print(f"  Test:  {len(test_windows):,} windows, {test_windows['student_id'].nunique()} students")
     print(f"  Segments: {len(train_segments):,} train, {len(test_segments):,} test")
 
-    # Load dataset stats if available
+    # Dataset stats
     stats_path = os.path.join(ROOT_DIR, 'figures', 'dataset_stats.json')
     if os.path.exists(stats_path):
         with open(stats_path) as f:
             ds_stats = json.load(f)
         combined = ds_stats.get('combined', {})
         print(f"\n  Dataset overview:")
-        print(f"    Students:           {combined.get('students', '?')}")
-        print(f"    Students using AI:  {combined.get('students_with_ai', '?')}")
-        print(f"    Tasks completed:    {combined.get('tasks_completed', '?')}")
-        print(f"    Total minutes:      {combined.get('total_minutes', '?')}")
-        print(f"    Raw events:         {combined.get('total_events', 0):,}")
-        print(f"    Events (no mouse):  {combined.get('events_no_mouse', 0):,}")
-        print(f"    Code edits:         {combined.get('total_code_edits', 0):,}")
-        print(f"    Terminal runs:      {combined.get('total_terminal_runs', 0):,}")
-        print(f"    Terminal errors:    {combined.get('total_errors', 0):,}")
-        print(f"    AI queries:         {combined.get('total_queries', 0):,}")
-        print(f"    Segments:           {combined.get('total_segments', 0):,}")
+        for key in ['students', 'students_with_ai', 'tasks_completed', 'total_minutes',
+                     'total_events', 'events_no_mouse', 'total_code_edits',
+                     'total_terminal_runs', 'total_errors', 'total_queries', 'total_segments']:
+            val = combined.get(key, '?')
+            label = key.replace('_', ' ').replace('total ', '').title()
+            print(f"    {label:<20s} {val:,}" if isinstance(val, int) else f"    {label:<20s} {val}")
 
-    # Window-level feature layers
     window_layers = {
-        'Raw telemetry':        [c for c in LAYER_1_FEATURES if c in train_windows.columns],
-        '+Observable':          [c for c in LAYER_2_FEATURES if c in train_windows.columns],
-        '+Behav. sequences':    [c for c in LAYER_3_FEATURES if c in train_windows.columns],
+        'Raw telemetry':     [c for c in LAYER_1_FEATURES if c in train_windows.columns],
+        '+Observable':       [c for c in LAYER_2_FEATURES if c in train_windows.columns],
+        '+Behav. sequences': [c for c in LAYER_3_FEATURES if c in train_windows.columns],
     }
 
     results = {}
@@ -931,10 +724,9 @@ def main():
 
     if tasks.get('next_behavioral_state'):
         print("\n" + "=" * 60)
-        print("  TASK 1: NEXT BEHAVIORAL STATE (multiclass)")
+        print("  TASK 1: NEXT BEHAVIORAL STATE (5-class)")
         print("=" * 60)
 
-        # State distribution
         valid = train_windows.dropna(subset=['label_next_state'])
         dist = valid['label_next_state'].value_counts()
         print(f"\n  State distribution (train):")
@@ -950,7 +742,6 @@ def main():
         if res:
             results['next_behavioral_state'] = res
 
-            # Per-class breakdown for best model
             best = 'XGBoost' if 'XGBoost' in res else 'RandomForest'
             best_cond = '+Behav. sequences'
             if best in res and best_cond in res[best]:
@@ -965,15 +756,14 @@ def main():
                             print(f"  {sn:<20s} {s['precision']:>8.3f} {s['recall']:>8.3f} {s['f1-score']:>8.3f} {int(s['support']):>8d}")
 
     # ══════════════════════════════════════════════════════════
-    #  TASK 1a: THINKING SUBTYPE PREDICTION
+    #  TASK 1a: THINKING SUBTYPE
     # ══════════════════════════════════════════════════════════
 
     if tasks.get('next_behavioral_state') and 'label_next_thinking_subtype' in train_windows.columns:
         print("\n" + "=" * 60)
-        print("  TASK 1a: THINKING SUBTYPE (4-class, conditional)")
+        print("  TASK 1a: THINKING SUBTYPE (conditional)")
         print("=" * 60)
 
-        # Filter to windows where next state is thinking
         train_think = train_windows[train_windows['label_next_thinking_subtype'].notna()].copy()
         test_think = test_windows[test_windows['label_next_thinking_subtype'].notna()].copy()
 
@@ -991,14 +781,12 @@ def main():
             )
             if res:
                 results['thinking_subtype'] = res
-        else:
-            print("  SKIPPED (insufficient data)")
 
     # ══════════════════════════════════════════════════════════
     #  TASK 1b: NEXT BEHAVIORAL SEQUENCE
     # ══════════════════════════════════════════════════════════
 
-    if tasks.get('next_behavioral_sequence'):
+    if tasks.get('next_behavioral_state'):
         print("\n" + "=" * 60)
         print("  TASK 1b: NEXT BEHAVIORAL SEQUENCE")
         print("=" * 60)
@@ -1007,12 +795,36 @@ def main():
             run_sequence_prediction(train_windows, test_windows, k)
 
     # ══════════════════════════════════════════════════════════
-    #  TASK 2: QUERY IMMINENCE
+    #  TASK 2: ERROR IMMINENCE
+    # ══════════════════════════════════════════════════════════
+
+    if tasks.get('error_imminence'):
+        print("\n" + "=" * 60)
+        print("  TASK 2: ERROR IMMINENCE")
+        print("=" * 60)
+
+        for horizon in [15, 30, 60]:
+            label_col = f'label_error_imminence_{horizon}s'
+            if label_col not in train_windows.columns:
+                continue
+
+            print(f"\n  --- {horizon}s horizon ---")
+            res = run_ablation(
+                train_windows, test_windows,
+                f'Error imminence ({horizon}s)', label_col,
+                window_layers, task_type='binary',
+                seg_train=train_segments, seg_test=test_segments,
+            )
+            if res:
+                results[f'error_imminence_{horizon}s'] = res
+
+    # ══════════════════════════════════════════════════════════
+    #  TASK 3: QUERY IMMINENCE
     # ══════════════════════════════════════════════════════════
 
     if tasks.get('query_imminence'):
         print("\n" + "=" * 60)
-        print("  TASK 2: QUERY IMMINENCE")
+        print("  TASK 3: QUERY IMMINENCE")
         print("=" * 60)
 
         for horizon in [5, 10, 15, 30, 45, 60]:
@@ -1031,238 +843,34 @@ def main():
                 results[f'query_imminence_{horizon}s'] = res
 
     # ══════════════════════════════════════════════════════════
-    #  TASK 2b: TIME TO NEXT QUERY (regression)
+    #  TASK 4: POST-QUERY IMPROVEMENT
     # ══════════════════════════════════════════════════════════
 
-    if tasks.get('query_imminence') and 'label_time_to_next_query_s' in train_windows.columns:
+    if tasks.get('post_query_improvement'):
         print("\n" + "=" * 60)
-        print("  TASK 2b: TIME TO NEXT QUERY (regression)")
+        print("  TASK 4: POST-QUERY IMPROVEMENT")
         print("=" * 60)
 
-        # Full regression (all windows, capped at 300s)
-        print("\n  --- All windows (capped at 300s) ---")
-        reg_results = run_regression(
-            train_windows, test_windows,
-            'Time to next query (all)', 'label_time_to_next_query_s',
-            window_layers, max_target=300,
-        )
-        if reg_results:
-            results['time_to_next_query_all'] = reg_results
-
-        # Filtered regression — only windows within 60s of a query
-        print("\n  --- Imminent windows only (within 60s of query) ---")
-        train_imminent = train_windows[
-            (train_windows['label_time_to_next_query_s'].notna()) &
-            (train_windows['label_time_to_next_query_s'] <= 60)
-        ].copy()
-        test_imminent = test_windows[
-            (test_windows['label_time_to_next_query_s'].notna()) &
-            (test_windows['label_time_to_next_query_s'] <= 60)
-        ].copy()
-
-        reg_results_60 = run_regression(
-            train_imminent, test_imminent,
-            'Time to next query (≤60s)', 'label_time_to_next_query_s',
-            window_layers, max_target=60,
-        )
-        if reg_results_60:
-            results['time_to_next_query_imminent'] = reg_results_60
-
-        # Filtered regression — only windows within 30s of a query
-        print("\n  --- Imminent windows only (within 30s of query) ---")
-        train_imminent_30 = train_windows[
-            (train_windows['label_time_to_next_query_s'].notna()) &
-            (train_windows['label_time_to_next_query_s'] <= 30)
-        ].copy()
-        test_imminent_30 = test_windows[
-            (test_windows['label_time_to_next_query_s'].notna()) &
-            (test_windows['label_time_to_next_query_s'] <= 30)
-        ].copy()
-
-        reg_results_30 = run_regression(
-            train_imminent_30, test_imminent_30,
-            'Time to next query (≤30s)', 'label_time_to_next_query_s',
-            window_layers, max_target=30,
-        )
-        if reg_results_30:
-            results['time_to_next_query_30s'] = reg_results_30
-
-    # ══════════════════════════════════════════════════════════
-    #  TASK 3: QUERY WITH NO EFFORT
-    # ══════════════════════════════════════════════════════════
-
-    if tasks.get('query_with_no_effort'):
-        print("\n" + "=" * 60)
-        print("  TASK 3: QUERY WITH NO EFFORT")
-        print("=" * 60)
-
-        # Load query datasets
         train_queries = pd.concat([load_dataset(n, 'queries') for n in train_names], ignore_index=True)
         test_queries = pd.concat([load_dataset(n, 'queries') for n in test_names], ignore_index=True)
 
         print(f"  Train: {len(train_queries)} queries | Test: {len(test_queries)} queries")
 
-        # Query-level feature layers (strip post features to avoid leakage)
         q_layers = {
-            'Raw telemetry':     [c for c in Q_LAYER_1 if c in train_queries.columns and c not in POST_LEAKY],
-            '+Observable':       [c for c in Q_LAYER_2 if c in train_queries.columns and c not in POST_LEAKY],
-            '+Behav. sequences': [c for c in Q_LAYER_3 if c in train_queries.columns and c not in POST_LEAKY],
+            'Raw telemetry':     [c for c in Q_LAYER_1 if c in train_queries.columns],
+            '+Observable':       [c for c in Q_LAYER_2 if c in train_queries.columns],
+            '+Behav. sequences': [c for c in Q_LAYER_3 if c in train_queries.columns],
         }
 
         res = run_ablation(
             train_queries, test_queries,
-            'Query with no effort', 'label_query_no_effort',
+            'Post-query improvement', 'label_post_query_improvement',
             q_layers, task_type='binary',
             seg_train=train_segments, seg_test=test_segments,
             time_col='time_since_session_start_s',
         )
         if res:
-            results['query_with_no_effort'] = res
-
-    # ══════════════════════════════════════════════════════════
-    #  TASK 3b: NEXT QUERY NO EFFORT (predictive, window-level)
-    # ══════════════════════════════════════════════════════════
-
-    if tasks.get('query_with_no_effort') and 'label_next_query_no_effort' in train_windows.columns:
-        print("\n" + "=" * 60)
-        print("  TASK 3b: NEXT QUERY NO EFFORT (predictive)")
-        print("=" * 60)
-
-        res = run_ablation(
-            train_windows, test_windows,
-            'Next query no effort', 'label_next_query_no_effort',
-            window_layers, task_type='binary',
-            seg_train=train_segments, seg_test=test_segments,
-        )
-        if res:
-            results['next_query_no_effort'] = res
-
-    # ══════════════════════════════════════════════════════════
-    #  TASK 3c: PROGRESS PREDICTION
-    # ══════════════════════════════════════════════════════════
-
-    if 'label_progress' in train_windows.columns:
-        print("\n" + "=" * 60)
-        print("  TASK 3c: PROGRESS (will test pass count increase in 60s?)")
-        print("=" * 60)
-
-        res = run_ablation(
-            train_windows, test_windows,
-            'Progress prediction', 'label_progress',
-            window_layers, task_type='binary',
-            seg_train=train_segments, seg_test=test_segments,
-        )
-        if res:
-            results['progress'] = res
-
-    # ══════════════════════════════════════════════════════════
-    #  TASK 3d: ERROR IMMINENCE
-    # ══════════════════════════════════════════════════════════
-
-    if 'label_error_imminence_30s' in train_windows.columns:
-        print("\n" + "=" * 60)
-        print("  TASK 3d: ERROR IMMINENCE")
-        print("=" * 60)
-
-        for horizon in [15, 30, 60]:
-            label_col = f'label_error_imminence_{horizon}s'
-            if label_col not in train_windows.columns:
-                continue
-            print(f"\n  --- {horizon}s horizon ---")
-            res = run_ablation(
-                train_windows, test_windows,
-                f'Error imminence ({horizon}s)', label_col,
-                window_layers, task_type='binary',
-                seg_train=train_segments, seg_test=test_segments,
-            )
-            if res:
-                results[f'error_imminence_{horizon}s'] = res
-                
-    # ══════════════════════════════════════════════════════════
-    #  TASK 4: HIGH DELEGATION QUERY (binary)
-    # ══════════════════════════════════════════════════════════
-
-    if tasks.get('query_type'):
-        print("\n" + "=" * 60)
-        print("  TASK 4: HIGH DELEGATION QUERY (binary)")
-        print("=" * 60)
-
-        # Load query datasets
-        train_queries = pd.concat([load_dataset(n, 'queries') for n in train_names], ignore_index=True)
-        test_queries = pd.concat([load_dataset(n, 'queries') for n in test_names], ignore_index=True)
-
-        # Load query type labels
-        label_dfs = []
-        for name in train_names + test_names:
-            label_path = os.path.join(DATASET_DIR, 'query_labels', f'{name}_labels.csv')
-            if os.path.exists(label_path):
-                ldf = pd.read_csv(label_path)
-                ldf['student_id'] = ldf['student_id'].astype(str)
-                label_dfs.append(ldf)
-            else:
-                print(f"  WARNING: {label_path} not found")
-
-        if label_dfs:
-            all_labels = pd.concat(label_dfs, ignore_index=True)
-
-            # Merge labels into queries
-            train_queries = train_queries.merge(
-                all_labels[['student_id', 'query_index', 'query_type']],
-                on=['student_id', 'query_index'], how='left'
-            )
-            test_queries = test_queries.merge(
-                all_labels[['student_id', 'query_index', 'query_type']],
-                on=['student_id', 'query_index'], how='left'
-            )
-
-            # Drop Unknown and empty labels
-            train_queries = train_queries[
-                train_queries['query_type'].notna() &
-                (train_queries['query_type'] != '') &
-                (train_queries['query_type'] != 'Unknown')
-            ].copy()
-            test_queries = test_queries[
-                test_queries['query_type'].notna() &
-                (test_queries['query_type'] != '') &
-                (test_queries['query_type'] != 'Unknown')
-            ].copy()
-
-            # Binary label: high_delegation vs everything else
-            train_queries['label_high_delegation'] = (train_queries['query_type'] == 'high_delegation').astype(int)
-            test_queries['label_high_delegation'] = (test_queries['query_type'] == 'high_delegation').astype(int)
-
-            print(f"  Train: {len(train_queries)} queries ({train_queries['label_high_delegation'].mean()*100:.1f}% high delegation)")
-            print(f"  Test:  {len(test_queries)} queries ({test_queries['label_high_delegation'].mean()*100:.1f}% high delegation)")
-
-            print(f"\n  Query type distribution (train):")
-            for qt, count in train_queries['query_type'].value_counts().items():
-                print(f"    {qt}: {count}")
-
-            # Use only pre-query features (no post, no query content)
-            QUERY_CONTENT_FEATURES = {'query_length_chars', 'ai_response_length_chars'}
-            q_layers = {
-                'Raw telemetry':     [c for c in Q_LAYER_1 if c in train_queries.columns and c not in POST_LEAKY and c not in QUERY_CONTENT_FEATURES],
-                '+Observable':       [c for c in Q_LAYER_2 if c in train_queries.columns and c not in POST_LEAKY and c not in QUERY_CONTENT_FEATURES],
-                '+Behav. sequences': [c for c in Q_LAYER_3 if c in train_queries.columns and c not in POST_LEAKY and c not in QUERY_CONTENT_FEATURES],
-            }
-
-            res = run_ablation(
-                train_queries, test_queries,
-                'High delegation query', 'label_high_delegation',
-                q_layers, task_type='binary',
-                seg_train=train_segments, seg_test=test_segments,
-                time_col='time_since_session_start_s',
-            )
-            if res:
-                results['high_delegation'] = res
-        else:
-            print("  SKIPPED (no query type labels found)")
-
-    # ══════════════════════════════════════════════════════════
-    #  WINDOW SIZE ANALYSIS
-    # ══════════════════════════════════════════════════════════
-
-    run_window_size_analysis(train_windows, test_windows)
+            results['post_query_improvement'] = res
 
     # ══════════════════════════════════════════════════════════
     #  FEATURE IMPORTANCE
@@ -1272,20 +880,19 @@ def main():
     print("  FEATURE IMPORTANCE (Top 15)")
     print("=" * 60)
 
-    print_importance(train_windows, 'label_next_state', 'Next behavioral state', LAYER_3_FEATURES)
+    if tasks.get('next_behavioral_state'):
+        print_importance(train_windows, 'label_next_state', 'Next behavioral state', LAYER_3_FEATURES)
 
-    if 'label_next_thinking_subtype' in train_windows.columns:
-        train_think = train_windows[train_windows['label_next_thinking_subtype'].notna()]
-        if len(train_think) > 0:
-            print_importance(train_think, 'label_next_thinking_subtype', 'Thinking subtype', LAYER_3_FEATURES)
+    if tasks.get('error_imminence'):
+        print_importance(train_windows, 'label_error_imminence_15s', 'Error imminence (15s)', LAYER_3_FEATURES)
 
     if tasks.get('query_imminence'):
-        print_importance(train_windows, 'label_query_imminence_15s', 'Query imminence (15s)', LAYER_3_FEATURES)      
+        print_importance(train_windows, 'label_query_imminence_15s', 'Query imminence (15s)', LAYER_3_FEATURES)
 
-    if tasks.get('query_with_no_effort'):
+    if tasks.get('post_query_improvement'):
         train_queries = pd.concat([load_dataset(n, 'queries') for n in train_names], ignore_index=True)
-        q_feats = [c for c in Q_LAYER_3 if c not in POST_LEAKY]
-        print_importance(train_queries, 'label_query_no_effort', 'Query with no effort', q_feats)
+        q_feats = [c for c in Q_LAYER_3 if c in train_queries.columns]
+        print_importance(train_queries, 'label_post_query_improvement', 'Post-query improvement', q_feats)
 
     # ══════════════════════════════════════════════════════════
     #  SUMMARY
@@ -1302,12 +909,11 @@ def main():
 
   Tasks:
     1. Next behavioral state (5-class)
-       1a. Thinking subtype (4-class, conditional)
+       1a. Thinking subtype (conditional)
        1b. Next behavioral sequence (k=3, k=5)
-    2. Query imminence (5s, 10s, 15s, 30s, 45s, 60s)
-       2b. Time to next query (regression)
-    3. Query with no effort (binary)
-    4. High delegation query (binary)
+    2. Error imminence (15s, 30s, 60s)
+    3. Query imminence (5s, 10s, 15s, 30s, 45s, 60s)
+    4. Post-query improvement (binary)
 
   Ablation: Raw telemetry → +Observable metrics → +Behavioral sequences
   Baselines: Majority, LogReg, RF{', XGBoost' if HAS_XGBOOST else ''}{', MLP, Seq-LSTM, Seq-GRU, Seq-CNN, Seq-Transformer, XGB+Best' if HAS_TORCH else ''}
