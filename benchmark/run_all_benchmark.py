@@ -29,7 +29,7 @@ TASKS = {
     'next_behavioral_state': False,
     'error_imminence': True,
     'query_imminence': False,
-    'query_type': True,
+    'query_type': False,
 }
 
 ALL_DEPLOYMENTS = {
