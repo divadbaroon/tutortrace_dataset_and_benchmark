@@ -1,4 +1,4 @@
-# IDETrace: A Dataset for Novice Programmer Behavior Prediction in AI-Assisted Coding
+# A Dataset for Novice Programmer Behavior Prediction in AI-Assisted Coding
 
 ## Overview
 
